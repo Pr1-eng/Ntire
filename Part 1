@@ -1,0 +1,207 @@
+#!/bin/bash
+
+# ==========================================
+# PART 2: Training, Losses & Utilities
+# ==========================================
+
+# 6. Write src/losses.py
+echo "⚖️ Generating losses.py..."
+cat << 'EOF' > NTIRE26_ISP/src/losses.py
+import torch
+import torch.nn as nn
+import torchvision.transforms as T
+from torchvision.models import vgg19
+
+class LossEngine:
+    def __init__(self, device):
+        self.device = device
+        vgg = vgg19(pretrained=True).features
+        self.vgg = vgg[:12].to(device).eval()
+        for param in self.vgg.parameters():
+            param.requires_grad = False
+            
+        self.l1 = nn.L1Loss()
+        self.grayscale = T.Grayscale(num_output_channels=3)
+        self.blur = T.GaussianBlur(kernel_size=21, sigma=3.0)
+
+    def get_content_loss(self, fake, raw):
+        raw_vis = torch.mean(raw, dim=1, keepdim=True)
+        raw_vis = torch.nn.functional.interpolate(raw_vis, scale_factor=2, mode='bilinear')
+        raw_vis = raw_vis.repeat(1, 3, 1, 1)
+        
+        f_fake = self.vgg(self.grayscale(fake))
+        f_raw = self.vgg(raw_vis)
+        return self.l1(f_fake, f_raw)
+
+    def get_ragan_loss(self, discriminator, real, fake):
+        pred_real = discriminator(real)
+        pred_fake = discriminator(fake)
+        loss_real = self.l1(pred_real - torch.mean(pred_fake), torch.ones_like(pred_real))
+        loss_fake = self.l1(pred_fake - torch.mean(pred_real), torch.zeros_like(pred_fake))
+        return (loss_real + loss_fake) / 2
+
+    def color_preprocess(self, x): return self.blur(x)
+    def texture_preprocess(self, x): return self.grayscale(x)
+EOF
+
+# 7. Write train.py (Multi-GPU)
+echo "🚀 Generating train.py..."
+cat << 'EOF' > NTIRE26_ISP/train.py
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import DataLoader
+import os
+import time
+from src.config import Config
+from src.dataset import UnpairedISPDataset
+from src.model import ISPNet, Discriminator
+from src.losses import LossEngine
+from src.logger import setup_logger
+
+def main():
+    os.makedirs(Config.OUTPUT_DIR, exist_ok=True)
+    logger = setup_logger(Config.OUTPUT_DIR, Config.LOG_FILENAME)
+    
+    device = torch.device(Config.DEVICE)
+    gpu_count = torch.cuda.device_count()
+    total_batch_size = Config.get_total_batch_size()
+    
+    logger.info("="*50)
+    logger.info(f"🚀 Starting {Config.PROJECT_NAME}")
+    logger.info(f"💻 GPUs Detected: {gpu_count} | Batch Size: {total_batch_size}")
+    logger.info("="*50)
+    
+    dataset = UnpairedISPDataset(Config.DATA_ROOT, mode='train')
+    loader = DataLoader(dataset, batch_size=total_batch_size, shuffle=True, 
+                        num_workers=Config.NUM_WORKERS, pin_memory=True)
+
+    net_G = ISPNet().to(device)
+    net_D_color = Discriminator().to(device)
+    net_D_texture = Discriminator().to(device)
+    
+    if gpu_count > 1:
+        net_G = nn.DataParallel(net_G)
+        net_D_color = nn.DataParallel(net_D_color)
+        net_D_texture = nn.DataParallel(net_D_texture)
+    
+    opt_G = optim.Adam(net_G.parameters(), lr=Config.LR_G, betas=(0.5, 0.999))
+    opt_D = optim.Adam(list(net_D_color.parameters()) + list(net_D_texture.parameters()), 
+                       lr=Config.LR_D, betas=(0.5, 0.999))
+    
+    losses = LossEngine(device)
+    
+    for epoch in range(Config.NUM_EPOCHS):
+        start_time = time.time()
+        net_G.train()
+        epoch_loss_G = 0.0
+        epoch_loss_D = 0.0
+        is_warmup = epoch < Config.WARMUP_EPOCHS
+        
+        for i, batch in enumerate(loader):
+            raw = batch['raw'].to(device)
+            real_rgb = batch['rgb'].to(device)
+            
+            # --- Update Discriminators ---
+            if not is_warmup:
+                opt_D.zero_grad()
+                with torch.no_grad(): fake_rgb = net_G(raw)
+                
+                l_d_color = losses.get_ragan_loss(net_D_color, losses.color_preprocess(real_rgb), losses.color_preprocess(fake_rgb))
+                l_d_texture = losses.get_ragan_loss(net_D_texture, losses.texture_preprocess(real_rgb), losses.texture_preprocess(fake_rgb))
+                loss_D = l_d_color + l_d_texture
+                loss_D.backward()
+                opt_D.step()
+                epoch_loss_D += loss_D.item()
+
+            # --- Update Generator ---
+            opt_G.zero_grad()
+            fake_rgb = net_G(raw)
+            l_content = losses.get_content_loss(fake_rgb, raw) * Config.W_CONTENT
+            
+            if not is_warmup:
+                # RaGAN for G
+                pred_fake_c = net_D_color(losses.color_preprocess(fake_rgb))
+                pred_real_c = net_D_color(losses.color_preprocess(real_rgb)).detach()
+                l_adv_c = (torch.mean((pred_real_c - torch.mean(pred_fake_c) + 1)**2) + torch.mean((pred_fake_c - torch.mean(pred_real_c) - 1)**2)) / 2
+                
+                pred_fake_t = net_D_texture(losses.texture_preprocess(fake_rgb))
+                pred_real_t = net_D_texture(losses.texture_preprocess(real_rgb)).detach()
+                l_adv_t = (torch.mean((pred_real_t - torch.mean(pred_fake_t) + 1)**2) + torch.mean((pred_fake_t - torch.mean(pred_real_t) - 1)**2)) / 2
+                
+                total_G = l_content + (l_adv_c * Config.W_COLOR) + (l_adv_t * Config.W_TEXTURE)
+            else:
+                total_G = l_content
+            
+            total_G.backward()
+            opt_G.step()
+            epoch_loss_G += total_G.item()
+            
+            if i % Config.LOG_INTERVAL == 0:
+                d_val = loss_D.item() if not is_warmup else 0.0
+                logger.info(f"[Ep {epoch}][Bt {i}/{len(loader)}] G: {total_G.item():.4f} | D: {d_val:.4f}")
+
+        avg_G = epoch_loss_G / len(loader)
+        avg_D = epoch_loss_D / len(loader) if not is_warmup else 0.0
+        logger.info(f"✅ Epoch {epoch} Done in {time.time()-start_time:.1f}s. Avg G: {avg_G:.4f} | Avg D: {avg_D:.4f}")
+        
+        if epoch % Config.SAVE_INTERVAL == 0:
+            save_path = os.path.join(Config.OUTPUT_DIR, f"netG_epoch_{epoch}.pth")
+            torch.save(net_G.module.state_dict() if gpu_count > 1 else net_G.state_dict(), save_path)
+EOF
+
+# 8. Write plot_logs.py
+echo "📊 Generating plot_logs.py..."
+cat << 'EOF' > NTIRE26_ISP/plot_logs.py
+import matplotlib.pyplot as plt
+import re
+import argparse
+import os
+
+def parse_log(file_path):
+    batch_data = {'iter': [], 'g_loss': [], 'd_loss': []}
+    batch_pattern = re.compile(r"\[Ep (\d+)\]\[Bt (\d+)/\d+\] .*? G: ([\d\.]+) \| D: ([\d\.]+)")
+    
+    current_iter = 0
+    with open(file_path, 'r') as f:
+        for line in f:
+            match = batch_pattern.search(line)
+            if match:
+                batch_data['iter'].append(current_iter)
+                batch_data['g_loss'].append(float(match.group(3)))
+                batch_data['d_loss'].append(float(match.group(4)))
+                current_iter += 1
+    return batch_data
+
+def plot_dashboard(data, save_path):
+    plt.figure(figsize=(10, 6))
+    plt.plot(data['iter'], data['g_loss'], alpha=0.5, color='green', label='Generator')
+    plt.plot(data['iter'], data['d_loss'], alpha=0.5, color='red', label='Discriminator')
+    plt.title("Training Loss")
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    plt.savefig(save_path)
+    print(f"✅ Saved graph to {save_path}")
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--log", required=True)
+    parser.add_argument("--out", default="training_plot.png")
+    args = parser.parse_args()
+    data = parse_log(args.log)
+    if data['iter']: plot_dashboard(data, args.out)
+EOF
+
+# 9. Write requirements.txt
+echo "📦 Generating requirements.txt..."
+cat << 'EOF' > NTIRE26_ISP/requirements.txt
+torch>=2.0.0
+torchvision>=0.15.0
+numpy
+Pillow
+matplotlib
+EOF
+
+echo "✅ Setup Complete! Directory 'NTIRE26_ISP' created."
+echo "👉 Action: Move your .npy files to NTIRE26_ISP/data/train/raws/"
+echo "👉 Action: Run 'python NTIRE26_ISP/train.py'"
