@@ -1,0 +1,243 @@
+#!/bin/bash
+
+# ==========================================
+# PART 1: Project Structure & Core Modules
+# ==========================================
+
+# 1. Create Directory Structure
+echo "📂 Creating Project Structure..."
+mkdir -p NTIRE26_ISP/src
+mkdir -p NTIRE26_ISP/data/train/raws
+mkdir -p NTIRE26_ISP/data/train/jpegs
+mkdir -p NTIRE26_ISP/experiments
+
+# 2. Write src/config.py
+echo "⚙️ Generating config.py..."
+cat << 'EOF' > NTIRE26_ISP/src/config.py
+import os
+import torch
+from datetime import datetime
+
+class Config:
+    # --- Paths ---
+    PROJECT_NAME = "NTIRE26_V100_Run"
+    DATA_ROOT = "./data"
+    OUTPUT_DIR = "./experiments"
+    
+    # --- Logging ---
+    # Log filename: log_18_02_13.txt (Day_Month_Hour)
+    LOG_FILENAME = f"log_{datetime.now().strftime('%d_%m_%H')}.txt"
+    
+    # --- Hardware ---
+    DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+    NUM_WORKERS = 8         # V100s need fast CPU feeding
+    
+    # --- Training Settings ---
+    # Total Batch Size = BATCH_SIZE_PER_GPU * Num_GPUs
+    BATCH_SIZE_PER_GPU = 16 
+    
+    PATCH_SIZE = 256        # Input RAW patch
+    NUM_EPOCHS = 100
+    WARMUP_EPOCHS = 5
+    
+    # --- Optimization ---
+    LR_G = 1e-4
+    LR_D = 2e-4
+    
+    # --- Sensor Data (Sony IMX) ---
+    BLACK_LEVEL = 240
+    WHITE_LEVEL = 1023
+    
+    # --- Loss Weights ---
+    W_CONTENT = 1.0
+    W_COLOR = 0.5
+    W_TEXTURE = 0.5
+    
+    # --- Save Settings ---
+    SAVE_INTERVAL = 5
+    LOG_INTERVAL = 10
+
+    @staticmethod
+    def get_total_batch_size():
+        gpu_count = torch.cuda.device_count()
+        return Config.BATCH_SIZE_PER_GPU * (gpu_count if gpu_count > 0 else 1)
+EOF
+
+# 3. Write src/logger.py
+echo "📝 Generating logger.py..."
+cat << 'EOF' > NTIRE26_ISP/src/logger.py
+import logging
+import os
+import sys
+
+def setup_logger(output_dir, filename):
+    logger = logging.getLogger("NTIRE_Logger")
+    logger.setLevel(logging.INFO)
+    
+    if logger.hasHandlers():
+        logger.handlers.clear()
+        
+    log_path = os.path.join(output_dir, filename)
+    
+    # File Handler
+    file_handler = logging.FileHandler(log_path)
+    file_handler.setFormatter(logging.Formatter('%(asctime)s - %(message)s', datefmt='%Y-%m-%d %H:%M:%S'))
+    
+    # Console Handler
+    stream_handler = logging.StreamHandler(sys.stdout)
+    stream_handler.setFormatter(logging.Formatter('%(message)s'))
+    
+    logger.addHandler(file_handler)
+    logger.addHandler(stream_handler)
+    return logger
+EOF
+
+# 4. Write src/dataset.py
+echo "💿 Generating dataset.py..."
+cat << 'EOF' > NTIRE26_ISP/src/dataset.py
+import os
+import glob
+import numpy as np
+import torch
+from torch.utils.data import Dataset
+from PIL import Image
+import torchvision.transforms as T
+from .config import Config
+
+class UnpairedISPDataset(Dataset):
+    def __init__(self, root_dir, mode='train'):
+        self.mode = mode
+        self.patch_size = Config.PATCH_SIZE
+        
+        self.raw_paths = sorted(glob.glob(os.path.join(root_dir, mode, 'raws', '*.npy')))
+        self.rgb_paths = sorted(glob.glob(os.path.join(root_dir, mode, 'jpegs', '*.*')))
+        
+        self.len_raw = len(self.raw_paths)
+        self.len_rgb = len(self.rgb_paths)
+        self.length = max(self.len_raw, self.len_rgb)
+
+    def __len__(self):
+        return self.length
+
+    def pack_raw(self, raw):
+        # Input: (H, W) -> Output: (4, H/2, W/2)
+        # Packing pattern: R, Gr, Gb, B
+        im = raw
+        H, W = im.shape
+        if H % 2 != 0 or W % 2 != 0:
+            im = im[:H//2*2, :W//2*2]
+            
+        out = np.stack((im[0::2, 0::2], im[0::2, 1::2], 
+                        im[1::2, 0::2], im[1::2, 1::2]), axis=0)
+        return out
+
+    def normalize_raw(self, raw):
+        return np.clip((raw - Config.BLACK_LEVEL) / (Config.WHITE_LEVEL - Config.BLACK_LEVEL), 0, 1)
+
+    def __getitem__(self, idx):
+        # 1. Load RAW
+        idx_raw = idx % self.len_raw
+        raw = np.load(self.raw_paths[idx_raw]).astype(np.float32)
+        
+        # Random Crop RAW
+        H, W = raw.shape
+        if H > self.patch_size and W > self.patch_size:
+            xx = np.random.randint(0, W - self.patch_size)
+            yy = np.random.randint(0, H - self.patch_size)
+            raw = raw[yy:yy+self.patch_size, xx:xx+self.patch_size]
+        
+        raw = self.normalize_raw(raw)
+        raw_tensor = torch.from_numpy(self.pack_raw(raw)).float()
+        
+        # 2. Load Target RGB
+        idx_rgb = np.random.randint(0, self.len_rgb)
+        rgb = Image.open(self.rgb_paths[idx_rgb]).convert('RGB')
+        
+        target_size = self.patch_size * 2
+        transform = T.Compose([
+            T.Resize(int(target_size * 1.2)),
+            T.RandomCrop(target_size),
+            T.RandomHorizontalFlip(),
+            T.ToTensor()
+        ])
+        rgb_tensor = transform(rgb)
+        
+        return {"raw": raw_tensor, "rgb": rgb_tensor}
+EOF
+
+# 5. Write src/model.py
+echo "🧠 Generating model.py..."
+cat << 'EOF' > NTIRE26_ISP/src/model.py
+import torch
+import torch.nn as nn
+
+class DoubleConv(nn.Module):
+    def __init__(self, in_ch, out_ch):
+        super().__init__()
+        self.conv = nn.Sequential(
+            nn.Conv2d(in_ch, out_ch, 3, padding=1),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Conv2d(out_ch, out_ch, 3, padding=1),
+            nn.LeakyReLU(0.2, inplace=True)
+        )
+    def forward(self, x): return self.conv(x)
+
+class ISPNet(nn.Module):
+    def __init__(self):
+        super(ISPNet, self).__init__()
+        self.inc = DoubleConv(4, 32)
+        self.down1 = nn.Sequential(nn.MaxPool2d(2), DoubleConv(32, 64))
+        self.down2 = nn.Sequential(nn.MaxPool2d(2), DoubleConv(64, 128))
+        self.down3 = nn.Sequential(nn.MaxPool2d(2), DoubleConv(128, 256))
+        
+        self.up1 = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True)
+        self.conv1 = DoubleConv(128 + 256, 128)
+        self.up2 = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True)
+        self.conv2 = DoubleConv(64 + 128, 64)
+        self.up3 = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True)
+        self.conv3 = DoubleConv(32 + 64, 32)
+        
+        self.outc = nn.Conv2d(32, 12, 3, padding=1)
+        self.pixel_shuffle = nn.PixelShuffle(2)
+        
+    def forward(self, x):
+        x1 = self.inc(x)
+        x2 = self.down1(x1)
+        x3 = self.down2(x2)
+        x4 = self.down3(x3)
+        
+        x = self.up1(x4)
+        x = torch.cat([x, x3], dim=1)
+        x = self.conv1(x)
+        
+        x = self.up2(x)
+        x = torch.cat([x, x2], dim=1)
+        x = self.conv2(x)
+        
+        x = self.up3(x)
+        x = torch.cat([x, x1], dim=1)
+        x = self.conv3(x)
+        
+        x = self.outc(x)
+        x = self.pixel_shuffle(x)
+        return torch.sigmoid(x)
+
+class Discriminator(nn.Module):
+    def __init__(self):
+        super(Discriminator, self).__init__()
+        def discriminator_block(in_filters, out_filters, normalization=True):
+            layers = [nn.Conv2d(in_filters, out_filters, 4, stride=2, padding=1)]
+            if normalization: layers.append(nn.InstanceNorm2d(out_filters))
+            layers.append(nn.LeakyReLU(0.2, inplace=True))
+            return layers
+
+        self.model = nn.Sequential(
+            *discriminator_block(3, 64, normalization=False),
+            *discriminator_block(64, 128),
+            *discriminator_block(128, 256),
+            nn.Conv2d(256, 1, 3, padding=1)
+        )
+
+    def forward(self, x):
+        return self.model(x)
+EOF
