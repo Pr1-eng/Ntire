@@ -1,207 +1,356 @@
 #!/bin/bash
 
-# ==========================================
-# PART 2: Training, Losses & Utilities
-# ==========================================
+# 1. Define Project Name
+PROJECT_NAME="NTIRE2026_ISP"
 
-# 6. Write src/losses.py
-echo "⚖️ Generating losses.py..."
-cat << 'EOF' > NTIRE26_ISP/src/losses.py
+echo "============================================"
+echo "   Setting up NTIRE 2026 ISP Environment    "
+echo "============================================"
+
+# 2. Create Directory Structure
+mkdir -p $PROJECT_NAME/data/train/smartphone_raw
+mkdir -p $PROJECT_NAME/data/train/dslr_clean
+mkdir -p $PROJECT_NAME/data/val
+mkdir -p $PROJECT_NAME/logs
+mkdir -p $PROJECT_NAME/checkpoints
+mkdir -p $PROJECT_NAME/results
+
+cd $PROJECT_NAME
+
+# 3. Create requirements.txt
+cat <<EOT > requirements.txt
+torch>=2.1.0
+torchvision>=0.16.0
+numpy>=1.24.0
+opencv-python
+matplotlib
+tqdm
+pyyaml
+EOT
+echo "[✔] Created requirements.txt"
+
+# 4. Create config.json
+cat <<EOT > config.json
+{
+  "project_name": "NTIRE2026_Unpaired_ISP",
+  "paths": {
+    "input_raw": "./data/train/smartphone_raw/",
+    "input_dslr": "./data/train/dslr_clean/",
+    "log_dir": "./logs/",
+    "checkpoint_dir": "./checkpoints/",
+    "output_dir": "./results/"
+  },
+  "training": {
+    "epochs": 1000,
+    "batch_size": 4,
+    "lr": 0.0001,
+    "save_freq": 100,
+    "resume": {
+      "enable": false,
+      "checkpoint_path": "./checkpoints/isp_epoch_0300.pth"
+    }
+  },
+  "model": {
+    "in_channels": 4,
+    "out_channels": 3
+  }
+}
+EOT
+echo "[✔] Created config.json"
+
+# 5. Create dataset.py
+cat <<EOT > dataset.py
 import torch
-import torch.nn as nn
-import torchvision.transforms as T
-from torchvision.models import vgg19
+import numpy as np
+import glob
+import os
+from torch.utils.data import Dataset
+from PIL import Image
 
-class LossEngine:
-    def __init__(self, device):
-        self.device = device
-        vgg = vgg19(pretrained=True).features
-        self.vgg = vgg[:12].to(device).eval()
-        for param in self.vgg.parameters():
-            param.requires_grad = False
-            
-        self.l1 = nn.L1Loss()
-        self.grayscale = T.Grayscale(num_output_channels=3)
-        self.blur = T.GaussianBlur(kernel_size=21, sigma=3.0)
-
-    def get_content_loss(self, fake, raw):
-        raw_vis = torch.mean(raw, dim=1, keepdim=True)
-        raw_vis = torch.nn.functional.interpolate(raw_vis, scale_factor=2, mode='bilinear')
-        raw_vis = raw_vis.repeat(1, 3, 1, 1)
+class NTIREDataset(Dataset):
+    def __init__(self, raw_path, dslr_path):
+        self.raw_files = sorted(glob.glob(os.path.join(raw_path, "*.npy")))
+        self.dslr_files = sorted(glob.glob(os.path.join(dslr_path, "*.jpg")))
         
-        f_fake = self.vgg(self.grayscale(fake))
-        f_raw = self.vgg(raw_vis)
-        return self.l1(f_fake, f_raw)
+        if not self.raw_files:
+            print(f"WARNING: No .npy files found in {raw_path}")
+        if not self.dslr_files:
+            print(f"WARNING: No .jpg files found in {dslr_path}")
+            
+        self.len = max(len(self.raw_files), len(self.dslr_files)) if self.raw_files and self.dslr_files else 0
 
-    def get_ragan_loss(self, discriminator, real, fake):
-        pred_real = discriminator(real)
-        pred_fake = discriminator(fake)
-        loss_real = self.l1(pred_real - torch.mean(pred_fake), torch.ones_like(pred_real))
-        loss_fake = self.l1(pred_fake - torch.mean(pred_real), torch.zeros_like(pred_fake))
-        return (loss_real + loss_fake) / 2
+    def __len__(self):
+        return self.len
 
-    def color_preprocess(self, x): return self.blur(x)
-    def texture_preprocess(self, x): return self.grayscale(x)
-EOF
+    def __getitem__(self, idx):
+        raw_idx = idx % len(self.raw_files)
+        dslr_idx = idx % len(self.dslr_files)
 
-# 7. Write train.py (Multi-GPU)
-echo "🚀 Generating train.py..."
-cat << 'EOF' > NTIRE26_ISP/train.py
+        # Load 10-bit Bayer [H, W] -> Normalize to [0, 1]
+        try:
+            raw_data = np.load(self.raw_files[raw_idx]).astype(np.float32) / 1023.0
+        except Exception as e:
+            print(f"Error loading {self.raw_files[raw_idx]}: {e}")
+            return torch.zeros(4, 256, 256), torch.zeros(3, 512, 512)
+
+        # Pixel Unshuffle: [H, W] -> [4, H/2, W/2]
+        H, W = raw_data.shape
+        raw_stack = np.zeros((4, H//2, W//2), dtype=np.float32)
+        raw_stack[0] = raw_data[0::2, 0::2] # R
+        raw_stack[1] = raw_data[0::2, 1::2] # G1
+        raw_stack[2] = raw_data[1::2, 0::2] # G2
+        raw_stack[3] = raw_data[1::2, 1::2] # B
+        
+        # Load DSLR
+        try:
+            dslr_img = Image.open(self.dslr_files[dslr_idx]).convert('RGB')
+            dslr_data = np.array(dslr_img).astype(np.float32) / 255.0
+            dslr_tensor = torch.from_numpy(dslr_data).permute(2, 0, 1)
+        except Exception as e:
+            print(f"Error loading {self.dslr_files[dslr_idx]}: {e}")
+            return torch.from_numpy(raw_stack), torch.zeros(3, H, W)
+
+        return torch.from_numpy(raw_stack), dslr_tensor
+EOT
+echo "[✔] Created dataset.py"
+
+# 6. Create model.py
+cat <<EOT > model.py
 import torch
 import torch.nn as nn
-import torch.optim as optim
+
+class ResidualBlock(nn.Module):
+    def __init__(self, channels):
+        super().__init__()
+        self.conv = nn.Sequential(
+            nn.Conv2d(channels, channels, 3, padding=1, bias=False),
+            nn.InstanceNorm2d(channels),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(channels, channels, 3, padding=1, bias=False),
+            nn.InstanceNorm2d(channels)
+        )
+    def forward(self, x): return x + self.conv(x)
+
+class ISPNet(nn.Module):
+    def __init__(self):
+        super().__init__()
+        # Input: 4-channel Bayer (RGGB)
+        self.head = nn.Sequential(
+            nn.Conv2d(4, 64, 3, padding=1),
+            nn.ReLU(inplace=True)
+        )
+        # Body: 8 Residual Blocks
+        self.body = nn.Sequential(*[ResidualBlock(64) for _ in range(8)])
+        
+        # Tail: Upsample x2 to match original resolution
+        self.tail = nn.Sequential(
+            nn.ConvTranspose2d(64, 64, 4, stride=2, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(64, 3, 3, padding=1),
+            nn.Sigmoid() # Output [0, 1]
+        )
+
+    def forward(self, x):
+        feat = self.head(x)
+        res = self.body(feat)
+        out = self.tail(res)
+        return out
+EOT
+echo "[✔] Created model.py"
+
+# 7. Create train_dist.py (Multi-GPU Main Script)
+cat <<EOT > train_dist.py
+import os
+import json
+import torch
+import torch.nn as nn
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.data.distributed import DistributedSampler
 from torch.utils.data import DataLoader
-import os
-import time
-from src.config import Config
-from src.dataset import UnpairedISPDataset
-from src.model import ISPNet, Discriminator
-from src.losses import LossEngine
-from src.logger import setup_logger
+from datetime import datetime
+import logging
+from tqdm import tqdm
+import sys
 
-def main():
-    os.makedirs(Config.OUTPUT_DIR, exist_ok=True)
-    logger = setup_logger(Config.OUTPUT_DIR, Config.LOG_FILENAME)
-    
-    device = torch.device(Config.DEVICE)
-    gpu_count = torch.cuda.device_count()
-    total_batch_size = Config.get_total_batch_size()
-    
-    logger.info("="*50)
-    logger.info(f"🚀 Starting {Config.PROJECT_NAME}")
-    logger.info(f"💻 GPUs Detected: {gpu_count} | Batch Size: {total_batch_size}")
-    logger.info("="*50)
-    
-    dataset = UnpairedISPDataset(Config.DATA_ROOT, mode='train')
-    loader = DataLoader(dataset, batch_size=total_batch_size, shuffle=True, 
-                        num_workers=Config.NUM_WORKERS, pin_memory=True)
+from dataset import NTIREDataset
+from model import ISPNet 
 
-    net_G = ISPNet().to(device)
-    net_D_color = Discriminator().to(device)
-    net_D_texture = Discriminator().to(device)
-    
-    if gpu_count > 1:
-        net_G = nn.DataParallel(net_G)
-        net_D_color = nn.DataParallel(net_D_color)
-        net_D_texture = nn.DataParallel(net_D_texture)
-    
-    opt_G = optim.Adam(net_G.parameters(), lr=Config.LR_G, betas=(0.5, 0.999))
-    opt_D = optim.Adam(list(net_D_color.parameters()) + list(net_D_texture.parameters()), 
-                       lr=Config.LR_D, betas=(0.5, 0.999))
-    
-    losses = LossEngine(device)
-    
-    for epoch in range(Config.NUM_EPOCHS):
-        start_time = time.time()
-        net_G.train()
-        epoch_loss_G = 0.0
-        epoch_loss_D = 0.0
-        is_warmup = epoch < Config.WARMUP_EPOCHS
+def setup_dist(rank, world_size):
+    os.environ['MASTER_ADDR'] = 'localhost'
+    os.environ['MASTER_PORT'] = '12355'
+    dist.init_process_group("nccl", rank=rank, world_size=world_size)
+    torch.cuda.set_device(rank)
+
+def cleanup():
+    dist.destroy_process_group()
+
+def train(rank, world_size):
+    # Load Config
+    with open('config.json', 'r') as f:
+        cfg = json.load(f)
+
+    setup_dist(rank, world_size)
+
+    # Setup Logging (Rank 0 Only)
+    if rank == 0:
+        os.makedirs(cfg['paths']['log_dir'], exist_ok=True)
+        os.makedirs(cfg['paths']['checkpoint_dir'], exist_ok=True)
         
-        for i, batch in enumerate(loader):
-            raw = batch['raw'].to(device)
-            real_rgb = batch['rgb'].to(device)
-            
-            # --- Update Discriminators ---
-            if not is_warmup:
-                opt_D.zero_grad()
-                with torch.no_grad(): fake_rgb = net_G(raw)
-                
-                l_d_color = losses.get_ragan_loss(net_D_color, losses.color_preprocess(real_rgb), losses.color_preprocess(fake_rgb))
-                l_d_texture = losses.get_ragan_loss(net_D_texture, losses.texture_preprocess(real_rgb), losses.texture_preprocess(fake_rgb))
-                loss_D = l_d_color + l_d_texture
-                loss_D.backward()
-                opt_D.step()
-                epoch_loss_D += loss_D.item()
-
-            # --- Update Generator ---
-            opt_G.zero_grad()
-            fake_rgb = net_G(raw)
-            l_content = losses.get_content_loss(fake_rgb, raw) * Config.W_CONTENT
-            
-            if not is_warmup:
-                # RaGAN for G
-                pred_fake_c = net_D_color(losses.color_preprocess(fake_rgb))
-                pred_real_c = net_D_color(losses.color_preprocess(real_rgb)).detach()
-                l_adv_c = (torch.mean((pred_real_c - torch.mean(pred_fake_c) + 1)**2) + torch.mean((pred_fake_c - torch.mean(pred_real_c) - 1)**2)) / 2
-                
-                pred_fake_t = net_D_texture(losses.texture_preprocess(fake_rgb))
-                pred_real_t = net_D_texture(losses.texture_preprocess(real_rgb)).detach()
-                l_adv_t = (torch.mean((pred_real_t - torch.mean(pred_fake_t) + 1)**2) + torch.mean((pred_fake_t - torch.mean(pred_real_t) - 1)**2)) / 2
-                
-                total_G = l_content + (l_adv_c * Config.W_COLOR) + (l_adv_t * Config.W_TEXTURE)
-            else:
-                total_G = l_content
-            
-            total_G.backward()
-            opt_G.step()
-            epoch_loss_G += total_G.item()
-            
-            if i % Config.LOG_INTERVAL == 0:
-                d_val = loss_D.item() if not is_warmup else 0.0
-                logger.info(f"[Ep {epoch}][Bt {i}/{len(loader)}] G: {total_G.item():.4f} | D: {d_val:.4f}")
-
-        avg_G = epoch_loss_G / len(loader)
-        avg_D = epoch_loss_D / len(loader) if not is_warmup else 0.0
-        logger.info(f"✅ Epoch {epoch} Done in {time.time()-start_time:.1f}s. Avg G: {avg_G:.4f} | Avg D: {avg_D:.4f}")
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        log_file = os.path.join(cfg['paths']['log_dir'], f"train_{timestamp}.log")
         
-        if epoch % Config.SAVE_INTERVAL == 0:
-            save_path = os.path.join(Config.OUTPUT_DIR, f"netG_epoch_{epoch}.pth")
-            torch.save(net_G.module.state_dict() if gpu_count > 1 else net_G.state_dict(), save_path)
-EOF
+        logging.basicConfig(
+            filename=log_file,
+            level=logging.INFO,
+            format='%(asctime)s - %(message)s',
+            datefmt='%Y-%m-%d %H:%M:%S'
+        )
+        print(f"Logging to: {log_file}")
 
-# 8. Write plot_logs.py
-echo "📊 Generating plot_logs.py..."
-cat << 'EOF' > NTIRE26_ISP/plot_logs.py
+    # Model Setup
+    model = ISPNet().to(rank)
+    model = DDP(model, device_ids=[rank])
+    optimizer = torch.optim.Adam(model.parameters(), lr=cfg['training']['lr'])
+    criterion = nn.L1Loss() 
+
+    # Resume Logic
+    start_epoch = 1
+    if cfg['training']['resume']['enable']:
+        ckpt_path = cfg['training']['resume']['checkpoint_path']
+        if os.path.isfile(ckpt_path):
+            if rank == 0: print(f"Resuming from: {ckpt_path}")
+            checkpoint = torch.load(ckpt_path, map_location=f'cuda:{rank}')
+            model.module.load_state_dict(checkpoint['model_state_dict'])
+            optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+            start_epoch = checkpoint['epoch'] + 1
+        else:
+            if rank == 0: print(f"Checkpoint not found. Starting from scratch.")
+
+    # Data Loading
+    dataset = NTIREDataset(cfg['paths']['input_raw'], cfg['paths']['input_dslr'])
+    if len(dataset) == 0:
+        if rank == 0: print("Error: Dataset is empty. Check data paths.")
+        cleanup()
+        return
+
+    sampler = DistributedSampler(dataset, num_replicas=world_size, rank=rank)
+    loader = DataLoader(dataset, batch_size=cfg['training']['batch_size'], 
+                        sampler=sampler, num_workers=4, pin_memory=True)
+
+    if rank == 0: print(f"Starting training on {world_size} GPUs...")
+    
+    for epoch in range(start_epoch, cfg['training']['epochs'] + 1):
+        sampler.set_epoch(epoch)
+        model.train()
+        epoch_loss = 0.0
+
+        if rank == 0:
+            pbar = tqdm(loader, desc=f"Epoch {epoch}", leave=False)
+        else:
+            pbar = loader
+
+        for raw, dslr in pbar:
+            raw, dslr = raw.to(rank), dslr.to(rank)
+
+            optimizer.zero_grad()
+            output = model(raw)
+            loss = criterion(output, dslr)
+            loss.backward()
+            optimizer.step()
+
+            epoch_loss += loss.item()
+            if rank == 0:
+                pbar.set_postfix(loss=loss.item())
+
+        if rank == 0:
+            avg_loss = epoch_loss / len(loader)
+            logging.info(f"Epoch: {epoch} | Loss: {avg_loss:.6f}")
+            
+            if epoch % cfg['training']['save_freq'] == 0:
+                save_path = os.path.join(cfg['paths']['checkpoint_dir'], f"isp_epoch_{epoch:04d}.pth")
+                torch.save({
+                    'epoch': epoch,
+                    'model_state_dict': model.module.state_dict(),
+                    'optimizer_state_dict': optimizer.state_dict(),
+                    'loss': avg_loss
+                }, save_path)
+                logging.info(f"Saved Checkpoint: {save_path}")
+
+    cleanup()
+
+if __name__ == "__main__":
+    if not torch.cuda.is_available():
+        print("Error: CUDA not found. Training requires GPU.")
+        sys.exit(1)
+        
+    world_size = torch.cuda.device_count()
+    torch.multiprocessing.spawn(train, args=(world_size,), nprocs=world_size, join=True)
+EOT
+echo "[✔] Created train_dist.py"
+
+# 8. Create visualize_logs.py
+cat <<EOT > visualize_logs.py
 import matplotlib.pyplot as plt
-import re
 import argparse
-import os
+import re
 
-def parse_log(file_path):
-    batch_data = {'iter': [], 'g_loss': [], 'd_loss': []}
-    batch_pattern = re.compile(r"\[Ep (\d+)\]\[Bt (\d+)/\d+\] .*? G: ([\d\.]+) \| D: ([\d\.]+)")
-    
-    current_iter = 0
-    with open(file_path, 'r') as f:
+def plot_logs(log_path):
+    epochs = []
+    losses = []
+    pattern = re.compile(r"Epoch:\s+(\d+)\s+\|\s+Loss:\s+([0-9.]+)")
+
+    print(f"Reading: {log_path}")
+    with open(log_path, 'r') as f:
         for line in f:
-            match = batch_pattern.search(line)
+            match = pattern.search(line)
             if match:
-                batch_data['iter'].append(current_iter)
-                batch_data['g_loss'].append(float(match.group(3)))
-                batch_data['d_loss'].append(float(match.group(4)))
-                current_iter += 1
-    return batch_data
+                epochs.append(int(match.group(1)))
+                losses.append(float(match.group(2)))
 
-def plot_dashboard(data, save_path):
+    if not epochs:
+        print("No valid data found in log file.")
+        return
+
     plt.figure(figsize=(10, 6))
-    plt.plot(data['iter'], data['g_loss'], alpha=0.5, color='green', label='Generator')
-    plt.plot(data['iter'], data['d_loss'], alpha=0.5, color='red', label='Discriminator')
-    plt.title("Training Loss")
+    plt.plot(epochs, losses, label='Training Loss', color='b', linewidth=2)
+    plt.xlabel('Epochs')
+    plt.ylabel('Loss (L1)')
+    plt.title(f'Training Progress')
+    plt.grid(True, linestyle='--', alpha=0.7)
     plt.legend()
-    plt.grid(True, alpha=0.3)
-    plt.savefig(save_path)
-    print(f"✅ Saved graph to {save_path}")
+    plt.savefig(log_path.replace('.log', '.png'))
+    print(f"Graph saved as .png")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--log", required=True)
-    parser.add_argument("--out", default="training_plot.png")
+    parser.add_argument('--log_path', type=str, required=True)
     args = parser.parse_args()
-    data = parse_log(args.log)
-    if data['iter']: plot_dashboard(data, args.out)
-EOF
+    plot_logs(args.log_path)
+EOT
+echo "[✔] Created visualize_logs.py"
 
-# 9. Write requirements.txt
-echo "📦 Generating requirements.txt..."
-cat << 'EOF' > NTIRE26_ISP/requirements.txt
-torch>=2.0.0
-torchvision>=0.15.0
-numpy
-Pillow
-matplotlib
-EOF
+# 9. Create run_training.sh
+cat <<EOT > run_training.sh
+#!/bin/bash
+# Check if data exists
+if [ -z "\$(ls -A data/train/smartphone_raw)" ]; then
+   echo "ERROR: Data folders are empty!"
+   echo "Please put .npy files in data/train/smartphone_raw/"
+   echo "Please put .jpg files in data/train/dslr_clean/"
+   exit 1
+fi
 
-echo "✅ Setup Complete! Directory 'NTIRE26_ISP' created."
-echo "👉 Action: Move your .npy files to NTIRE26_ISP/data/train/raws/"
-echo "👉 Action: Run 'python NTIRE26_ISP/train.py'"
+echo "Starting Multi-GPU Training..."
+python train_dist.py
+EOT
+chmod +x run_training.sh
+echo "[✔] Created run_training.sh"
+
+echo "============================================"
+echo "   SETUP COMPLETE! 🚀                       "
+echo "============================================"
+echo "Next Steps:"
+echo "1. Put your .npy files in: $PROJECT_NAME/data/train/smartphone_raw/"
+echo "2. Put your .jpg files in: $PROJECT_NAME/data/train/dslr_clean/"
+echo "3. Run: cd $PROJECT_NAME && ./run_training.sh"
